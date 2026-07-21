@@ -42,15 +42,20 @@ number of unique positions.
 For every matrix cell, the program:
 
 1. builds the selected index vector in memory;
-2. loads it into `v0-v3` before timing;
-3. performs a short warm-up;
-4. measures a loop containing exactly one `vluxei32.v` plus scalar loop
-   control; and
-5. reports the minimum of five runs as cycles per vector load.
+2. measures `baseline_kernel` once with `clock_gettime(CLOCK_MONOTONIC)`;
+3. measures `indexed_load_kernel` once with the same clock; and
+4. reports `(indexed_time - baseline_time) / iterations`.
+
+The two assembly kernels have the same ABI, vector setup, index load, scalar
+loop, sink store, and fence. The only instruction present in the indexed loop
+but absent from the baseline loop is `vluxei32.v v8, (a0), v0`.
+
+There is no separate short warm-up call and each matrix cell is measured once.
+The benchmark uses `clock_gettime()` rather than the inaccessible `cycle` CSR.
 
 `v8-v11` are written to a sink after the timed region so the final indexed load
-is architecturally observable. The 4 KiB data page remains resident between
-repeated runs, so the matrix describes hot-L1 execution rather than
+is architecturally observable. The 4 KiB data page remains resident while the
+matrix cells are measured, so the matrix describes hot-L1 execution rather than
 cache-capacity or page behavior. It is a steady-state instruction-cost benchmark;
 independent iterations may overlap on an out-of-order implementation, so the
 number should not be interpreted as dependent-use latency.
@@ -65,26 +70,43 @@ make
 ./indexed_load > result.csv
 ```
 
-Defaults match the original experiment: 100000 measured vector loads per cell,
-five repeats, and the full hardware VLMAX. They can be changed at runtime:
+The default iteration count is 100000. It and the maximum VL can be changed at
+runtime. Every matrix cell is measured exactly once:
 
 ```sh
-./indexed_load --iterations 200000 --repeats 7 --max-vl 32 > result.csv
+./indexed_load --iterations 200000 --max-vl 32 > result.csv
 ```
 
-`--max-vl` may reduce the number of rows but cannot exceed hardware VLMAX. Run
-`./indexed_load --help` for the option summary.
+Pass `--pattern` to run only one pattern and emit only that CSV column:
+
+```sh
+./indexed_load --pattern contiguous > contiguous.csv
+./indexed_load --pattern random_in_page --iterations 200000 > random.csv
+```
+
+Valid names are `contiguous`, `stride_16B`, `cacheline_64B`, and
+`random_in_page`. `--max-vl` may reduce the number of rows but cannot exceed
+hardware VLMAX. Run `./indexed_load --help` for the option summary.
+
+The same selection can be passed through the Makefile run target:
+
+```sh
+make run RUN_ARGS="--pattern contiguous --iterations 200000"
+```
 
 The output is directly usable as a two-dimensional CSV matrix:
 
 ```text
+CPU = 3
 vl,contiguous,stride_16B,cacheline_64B,random_in_page
 1,3.1200,3.1300,3.1200,3.1200
 2,3.1800,3.1900,3.2100,3.2300
 ...
 ```
 
-Values are cycles per `vluxei32.v` instruction, not cycles per element.
+Values are baseline-subtracted nanoseconds per `vluxei32.v` instruction, not
+nanoseconds per element. Because each kernel is measured once, timer or OS
+noise can occasionally produce a small negative difference; it is not clamped.
 
 ## Reference environment
 

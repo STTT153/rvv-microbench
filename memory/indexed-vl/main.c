@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200112L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <inttypes.h>
@@ -6,11 +6,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef __linux__
+#include <sched.h>
+#else
+static int sched_getcpu(void)
+{
+    return -1;
+}
+#endif
 
 extern size_t rvv_vlmax_e32m4(void);
-extern uint64_t indexed_load_kernel(const uint32_t *data,
-                                    const uint32_t *indices, size_t vl,
-                                    size_t iterations, uint32_t *sink);
+extern void indexed_load_kernel(const uint32_t *data, const uint32_t *indices,
+                                size_t vl, size_t iterations, uint32_t *sink);
+extern void baseline_kernel(const uint32_t *data, const uint32_t *indices,
+                            size_t vl, size_t iterations, uint32_t *sink);
 
 enum pattern {
     PATTERN_CONTIGUOUS,
@@ -25,6 +36,7 @@ static const char *const pattern_names[PATTERN_COUNT] = {
 };
 
 enum {
+    DEFAULT_ITERATIONS = 100000,
     TEST_PAGE_BYTES = 4096,
     WORDS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
@@ -33,12 +45,39 @@ enum {
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "Usage: %s [--iterations N] [--repeats N] [--max-vl N]\n"
+            "Usage: %s [--pattern NAME] [--iterations N] [--max-vl N]\n"
             "\n"
             "Print a CSV matrix whose rows are VL values and whose columns\n"
-            "are indexed-load access patterns. Values are cycles per\n"
-            "vluxei32.v instruction.\n",
+            "are indexed-load access patterns. If --pattern is omitted, all\n"
+            "patterns are run. Pattern names: contiguous, stride_16B,\n"
+            "cacheline_64B, random_in_page. Values are baseline-subtracted\n"
+            "nanoseconds per vluxei32.v instruction.\n",
             program);
+}
+
+static size_t parse_pattern(const char *text)
+{
+    for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
+        if (strcmp(text, pattern_names[pattern]) == 0)
+            return pattern;
+    }
+    fprintf(stderr, "unknown pattern: %s\n", text);
+    fprintf(stderr, "valid patterns:");
+    for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern)
+        fprintf(stderr, " %s", pattern_names[pattern]);
+    fputc('\n', stderr);
+    exit(EXIT_FAILURE);
+}
+
+static uint64_t monotonic_time_ns(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)now.tv_nsec;
 }
 
 static size_t parse_positive(const char *option, const char *text)
@@ -122,9 +161,9 @@ static void fill_indices(uint32_t *indices, const uint32_t *random_word_order,
 
 int main(int argc, char **argv)
 {
-    size_t iterations = 100000;
-    size_t repeats = 5;
+    size_t iterations = DEFAULT_ITERATIONS;
     size_t requested_max_vl = 0;
+    size_t selected_pattern = PATTERN_COUNT;
 
     for (int i = 1; i < argc; ++i) {
         const char *option = argv[i];
@@ -136,10 +175,10 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return EXIT_FAILURE;
         }
-        if (strcmp(argv[i], "--iterations") == 0)
+        if (strcmp(argv[i], "--pattern") == 0)
+            selected_pattern = parse_pattern(argv[++i]);
+        else if (strcmp(argv[i], "--iterations") == 0)
             iterations = parse_positive(option, argv[++i]);
-        else if (strcmp(argv[i], "--repeats") == 0)
-            repeats = parse_positive(option, argv[++i]);
         else if (strcmp(argv[i], "--max-vl") == 0)
             requested_max_vl = parse_positive(option, argv[++i]);
         else {
@@ -162,6 +201,8 @@ int main(int argc, char **argv)
                 max_vl, WORDS_PER_PAGE);
         return EXIT_FAILURE;
     }
+
+    // allocate test data
     const size_t data_bytes = TEST_PAGE_BYTES;
     uint32_t *data = allocate_aligned(TEST_PAGE_BYTES, data_bytes);
     uint32_t *indices =
@@ -176,28 +217,37 @@ int main(int argc, char **argv)
         data[i] = (uint32_t)(i * UINT32_C(2654435761));
     make_random_word_order(random_word_order);
 
+    printf("CPU = %d\n", sched_getcpu());
     printf("vl");
-    for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern)
+    for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
+        if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
+            continue;
         printf(",%s", pattern_names[pattern]);
+    }
     putchar('\n');
 
+    // test on vl from 1..VLMAX
     for (size_t vl = 1; vl <= max_vl; ++vl) {
         printf("%zu", vl);
+        // test against patterns
         for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
+            if (selected_pattern != PATTERN_COUNT &&
+                pattern != selected_pattern)
+                continue;
             fill_indices(indices, random_word_order, vl, (enum pattern)pattern);
 
-            size_t warmup_iterations = iterations < 1000 ? iterations : 1000;
-            (void)indexed_load_kernel(data, indices, vl, warmup_iterations,
-                                      sink);
+            uint64_t start = monotonic_time_ns();
+            baseline_kernel(data, indices, vl, iterations, sink);
+            uint64_t baseline_elapsed = monotonic_time_ns() - start;
 
-            uint64_t best_cycles = UINT64_MAX;
-            for (size_t repeat = 0; repeat < repeats; ++repeat) {
-                uint64_t cycles = indexed_load_kernel(
-                    data, indices, vl, iterations, sink);
-                if (cycles < best_cycles)
-                    best_cycles = cycles;
-            }
-            printf(",%.4f", (double)best_cycles / (double)iterations);
+            start = monotonic_time_ns();
+            indexed_load_kernel(data, indices, vl, iterations, sink);
+            uint64_t indexed_elapsed = monotonic_time_ns() - start;
+
+            double adjusted_nanoseconds =
+                ((double)indexed_elapsed - (double)baseline_elapsed) /
+                (double)iterations;
+            printf(",%.4f", adjusted_nanoseconds);
         }
         putchar('\n');
     }

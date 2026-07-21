@@ -37,6 +37,7 @@ static const char *const pattern_names[PATTERN_COUNT] = {
 
 enum {
     DEFAULT_ITERATIONS = 100000,
+    DEFAULT_REPEATS = 5,
     TEST_PAGE_BYTES = 4096,
     WORDS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
@@ -45,7 +46,8 @@ enum {
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "Usage: %s [--pattern NAME] [--iterations N] [--max-vl N]\n"
+            "Usage: %s [--pattern NAME] [--iterations N] [--repeats N]\n"
+            "          [--max-vl N]\n"
             "\n"
             "Print a CSV matrix whose rows are VL values and whose columns\n"
             "are indexed-load access patterns. If --pattern is omitted, all\n"
@@ -53,6 +55,21 @@ static void usage(const char *program)
             "cacheline_64B, random_in_page. Values are baseline-subtracted\n"
             "nanoseconds per vluxei32.v instruction.\n",
             program);
+}
+
+static int compare_double(const void *left, const void *right)
+{
+    const double a = *(const double *)left;
+    const double b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
+static double median(double *values, size_t count)
+{
+    qsort(values, count, sizeof(*values), compare_double);
+    if (count % 2 != 0)
+        return values[count / 2];
+    return (values[count / 2 - 1] + values[count / 2]) / 2.0;
 }
 
 static size_t parse_pattern(const char *text)
@@ -162,6 +179,7 @@ static void fill_indices(uint32_t *indices, const uint32_t *random_word_order,
 int main(int argc, char **argv)
 {
     size_t iterations = DEFAULT_ITERATIONS;
+    size_t repeats = DEFAULT_REPEATS;
     size_t requested_max_vl = 0;
     size_t selected_pattern = PATTERN_COUNT;
 
@@ -179,6 +197,8 @@ int main(int argc, char **argv)
             selected_pattern = parse_pattern(argv[++i]);
         else if (strcmp(argv[i], "--iterations") == 0)
             iterations = parse_positive(option, argv[++i]);
+        else if (strcmp(argv[i], "--repeats") == 0)
+            repeats = parse_positive(option, argv[++i]);
         else if (strcmp(argv[i], "--max-vl") == 0)
             requested_max_vl = parse_positive(option, argv[++i]);
         else {
@@ -212,6 +232,15 @@ int main(int argc, char **argv)
     uint32_t *random_word_order =
         allocate_aligned(TEST_PAGE_BYTES,
                          WORDS_PER_PAGE * sizeof(*random_word_order));
+    if (repeats > SIZE_MAX / sizeof(double)) {
+        fprintf(stderr, "--repeats %zu is too large\n", repeats);
+        return EXIT_FAILURE;
+    }
+    double *samples = malloc(repeats * sizeof(*samples));
+    if (samples == NULL) {
+        perror("malloc");
+        return EXIT_FAILURE;
+    }
 
     for (size_t i = 0; i < data_bytes / sizeof(*data); ++i)
         data[i] = (uint32_t)(i * UINT32_C(2654435761));
@@ -236,22 +265,38 @@ int main(int argc, char **argv)
                 continue;
             fill_indices(indices, random_word_order, vl, (enum pattern)pattern);
 
-            uint64_t start = monotonic_time_ns();
-            baseline_kernel(data, indices, vl, iterations, sink);
-            uint64_t baseline_elapsed = monotonic_time_ns() - start;
+            for (size_t repeat = 0; repeat < repeats; ++repeat) {
+                uint64_t baseline_elapsed;
+                uint64_t indexed_elapsed;
 
-            start = monotonic_time_ns();
-            indexed_load_kernel(data, indices, vl, iterations, sink);
-            uint64_t indexed_elapsed = monotonic_time_ns() - start;
+                if (repeat % 2 == 0) {
+                    uint64_t start = monotonic_time_ns();
+                    baseline_kernel(data, indices, vl, iterations, sink);
+                    baseline_elapsed = monotonic_time_ns() - start;
 
-            double adjusted_nanoseconds =
-                ((double)indexed_elapsed - (double)baseline_elapsed) /
-                (double)iterations;
-            printf(",%.4f", adjusted_nanoseconds);
+                    start = monotonic_time_ns();
+                    indexed_load_kernel(data, indices, vl, iterations, sink);
+                    indexed_elapsed = monotonic_time_ns() - start;
+                } else {
+                    uint64_t start = monotonic_time_ns();
+                    indexed_load_kernel(data, indices, vl, iterations, sink);
+                    indexed_elapsed = monotonic_time_ns() - start;
+
+                    start = monotonic_time_ns();
+                    baseline_kernel(data, indices, vl, iterations, sink);
+                    baseline_elapsed = monotonic_time_ns() - start;
+                }
+
+                samples[repeat] =
+                    ((double)indexed_elapsed - (double)baseline_elapsed) /
+                    (double)iterations;
+            }
+            printf(",%.4f", median(samples, repeats));
         }
         putchar('\n');
     }
 
+    free(samples);
     free(random_word_order);
     free(sink);
     free(indices);

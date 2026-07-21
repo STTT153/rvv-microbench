@@ -42,16 +42,20 @@ number of unique positions.
 For every matrix cell, the program:
 
 1. builds the selected index vector in memory;
-2. measures `baseline_kernel` once with `clock_gettime(CLOCK_MONOTONIC)`;
-3. measures `indexed_load_kernel` once with the same clock; and
-4. reports `(indexed_time - baseline_time) / iterations`.
+2. measures `baseline_kernel` and `indexed_load_kernel` as a pair with
+   `clock_gettime(CLOCK_MONOTONIC)`;
+3. repeats the pair for the configured repeat count, alternating which kernel
+   runs first;
+4. computes `(indexed_time - baseline_time) / iterations` for every pair; and
+5. reports the median paired difference.
 
 The two assembly kernels have the same ABI, vector setup, index load, scalar
 loop, sink store, and fence. The only instruction present in the indexed loop
 but absent from the baseline loop is `vluxei32.v v8, (a0), v0`.
 
-There is no separate short warm-up call and each matrix cell is measured once.
-The benchmark uses `clock_gettime()` rather than the inaccessible `cycle` CSR.
+There is no separate short warm-up call. Repeated pairs naturally warm the
+kernel while the median rejects scheduling and timer outliers. The benchmark
+uses `clock_gettime()` rather than the inaccessible `cycle` CSR.
 
 `v8-v11` are written to a sink after the timed region so the final indexed load
 is architecturally observable. The 4 KiB data page remains resident while the
@@ -70,18 +74,18 @@ make
 ./indexed_load > result.csv
 ```
 
-The default iteration count is 100000. It and the maximum VL can be changed at
-runtime. Every matrix cell is measured exactly once:
+The default iteration count is 100000 and the default repeat count is 5. They
+and the maximum VL can be changed at runtime:
 
 ```sh
-./indexed_load --iterations 200000 --max-vl 32 > result.csv
+./indexed_load --iterations 200000 --repeats 7 --max-vl 32 > result.csv
 ```
 
 Pass `--pattern` to run only one pattern and emit only that CSV column:
 
 ```sh
 ./indexed_load --pattern contiguous > contiguous.csv
-./indexed_load --pattern random_in_page --iterations 200000 > random.csv
+./indexed_load --pattern random_in_page --iterations 200000 --repeats 7 > random.csv
 ```
 
 Valid names are `contiguous`, `stride_16B`, `cacheline_64B`, and
@@ -91,7 +95,7 @@ hardware VLMAX. Run `./indexed_load --help` for the option summary.
 The same selection can be passed through the Makefile run target:
 
 ```sh
-make run RUN_ARGS="--pattern contiguous --iterations 200000"
+make run RUN_ARGS="--pattern contiguous --iterations 200000 --repeats 7"
 ```
 
 The output is directly usable as a two-dimensional CSV matrix:
@@ -104,9 +108,9 @@ vl,contiguous,stride_16B,cacheline_64B,random_in_page
 ...
 ```
 
-Values are baseline-subtracted nanoseconds per `vluxei32.v` instruction, not
-nanoseconds per element. Because each kernel is measured once, timer or OS
-noise can occasionally produce a small negative difference; it is not clamped.
+Values are median, baseline-subtracted nanoseconds per `vluxei32.v`
+instruction, not nanoseconds per element. Timer or OS noise can occasionally
+produce a small negative difference; it is not clamped.
 
 ## Reference environment
 

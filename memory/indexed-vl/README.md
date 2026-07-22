@@ -6,7 +6,7 @@ Measure the steady-state cost of one `vluxei32.v` while varying both vector
 length (VL) and the index access pattern. The result is a two-dimensional
 **VL × pattern** matrix.
 
-The vector configuration is `e32,m4`. Consequently, the default VL range is
+The vector configuration is `e32,m4,ta,ma`. Consequently, the default VL range is
 `1..VLMAX`, detected on the machine at runtime. For example, VLEN=256 gives a
 VLMAX of 32, while VLEN=1024 gives a VLMAX of 128.
 
@@ -46,8 +46,9 @@ For every matrix cell, the program:
    `clock_gettime(CLOCK_MONOTONIC)`;
 3. repeats the pair for the configured repeat count, alternating which kernel
    runs first;
-4. computes `(indexed_time - baseline_time) / iterations` for every pair; and
-5. reports the median paired difference.
+4. normalizes the raw baseline and indexed times by `iterations` and computes
+   `(indexed_time - baseline_time) / iterations` for every pair; and
+5. reports three medians: raw baseline, raw indexed, and paired difference.
 
 The two assembly kernels have the same ABI, vector setup, index load, scalar
 loop, sink store, and fence. The only instruction present in the indexed loop
@@ -98,19 +99,23 @@ The same selection can be passed through the Makefile run target:
 make run RUN_ARGS="--pattern contiguous --iterations 200000 --repeats 7"
 ```
 
-The output is directly usable as a two-dimensional CSV matrix:
+With `--pattern contiguous`, the output contains `vl` plus three measurement
+columns:
 
 ```text
 CPU = 3
-vl,contiguous,stride_16B,cacheline_64B,random_in_page
-1,3.1200,3.1300,3.1200,3.1200
-2,3.1800,3.1900,3.2100,3.2300
+vl,contiguous_baseline_ns,contiguous_indexed_ns,contiguous_difference_ns
+1,1.1200,154.4400,153.3200
+2,1.1100,193.0600,191.9500
 ...
 ```
 
-Values are median, baseline-subtracted nanoseconds per `vluxei32.v`
-instruction, not nanoseconds per element. Timer or OS noise can occasionally
-produce a small negative difference; it is not clamped.
+All values are nanoseconds per loop iteration, not nanoseconds per element.
+`difference_ns` is the median of paired differences; it is intentionally not
+computed by subtracting the two independently reported medians. Timer or OS
+noise can occasionally produce a small negative difference; it is not clamped.
+When all patterns are selected, every pattern contributes its own three-column
+group.
 
 ## Reference environment
 

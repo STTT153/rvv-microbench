@@ -52,8 +52,8 @@ static void usage(const char *program)
             "Print a CSV matrix whose rows are VL values and whose columns\n"
             "are indexed-load access patterns. If --pattern is omitted, all\n"
             "patterns are run. Pattern names: contiguous, stride_16B,\n"
-            "cacheline_64B, random_in_page. Values are baseline-subtracted\n"
-            "nanoseconds per vluxei32.v instruction.\n",
+            "cacheline_64B, random_in_page. Each pattern reports baseline,\n"
+            "indexed, and difference values in nanoseconds per iteration.\n",
             program);
 }
 
@@ -232,15 +232,18 @@ int main(int argc, char **argv)
     uint32_t *random_word_order =
         allocate_aligned(TEST_PAGE_BYTES,
                          WORDS_PER_PAGE * sizeof(*random_word_order));
-    if (repeats > SIZE_MAX / sizeof(double)) {
+    if (repeats > SIZE_MAX / (3 * sizeof(double))) {
         fprintf(stderr, "--repeats %zu is too large\n", repeats);
         return EXIT_FAILURE;
     }
-    double *samples = malloc(repeats * sizeof(*samples));
+    double *samples = malloc(3 * repeats * sizeof(*samples));
     if (samples == NULL) {
         perror("malloc");
         return EXIT_FAILURE;
     }
+    double *baseline_samples = samples;
+    double *indexed_samples = samples + repeats;
+    double *difference_samples = samples + 2 * repeats;
 
     for (size_t i = 0; i < data_bytes / sizeof(*data); ++i)
         data[i] = (uint32_t)(i * UINT32_C(2654435761));
@@ -251,7 +254,9 @@ int main(int argc, char **argv)
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s", pattern_names[pattern]);
+        printf(",%s_baseline_ns,%s_indexed_ns,%s_difference_ns",
+               pattern_names[pattern], pattern_names[pattern],
+               pattern_names[pattern]);
     }
     putchar('\n');
 
@@ -287,11 +292,17 @@ int main(int argc, char **argv)
                     baseline_elapsed = monotonic_time_ns() - start;
                 }
 
-                samples[repeat] =
+                baseline_samples[repeat] =
+                    (double)baseline_elapsed / (double)iterations;
+                indexed_samples[repeat] =
+                    (double)indexed_elapsed / (double)iterations;
+                difference_samples[repeat] =
                     ((double)indexed_elapsed - (double)baseline_elapsed) /
                     (double)iterations;
             }
-            printf(",%.4f", median(samples, repeats));
+            printf(",%.4f,%.4f,%.4f", median(baseline_samples, repeats),
+                   median(indexed_samples, repeats),
+                   median(difference_samples, repeats));
         }
         putchar('\n');
     }

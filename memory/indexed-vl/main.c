@@ -17,11 +17,47 @@ static int sched_getcpu(void)
 }
 #endif
 
+typedef size_t (*vlmax_function)(void);
+typedef void (*kernel_function)(const uint32_t *data,
+                                const uint32_t *indices, size_t vl,
+                                size_t iterations, uint32_t *sink);
+
+extern size_t rvv_vlmax_e32m1(void);
+extern size_t rvv_vlmax_e32m2(void);
 extern size_t rvv_vlmax_e32m4(void);
-extern void indexed_load_kernel(const uint32_t *data, const uint32_t *indices,
-                                size_t vl, size_t iterations, uint32_t *sink);
-extern void baseline_kernel(const uint32_t *data, const uint32_t *indices,
-                            size_t vl, size_t iterations, uint32_t *sink);
+extern size_t rvv_vlmax_e32m8(void);
+
+extern void indexed_load_kernel_m1(const uint32_t *, const uint32_t *, size_t,
+                                   size_t, uint32_t *);
+extern void indexed_load_kernel_m2(const uint32_t *, const uint32_t *, size_t,
+                                   size_t, uint32_t *);
+extern void indexed_load_kernel_m4(const uint32_t *, const uint32_t *, size_t,
+                                   size_t, uint32_t *);
+extern void indexed_load_kernel_m8(const uint32_t *, const uint32_t *, size_t,
+                                   size_t, uint32_t *);
+
+extern void baseline_kernel_m1(const uint32_t *, const uint32_t *, size_t,
+                               size_t, uint32_t *);
+extern void baseline_kernel_m2(const uint32_t *, const uint32_t *, size_t,
+                               size_t, uint32_t *);
+extern void baseline_kernel_m4(const uint32_t *, const uint32_t *, size_t,
+                               size_t, uint32_t *);
+extern void baseline_kernel_m8(const uint32_t *, const uint32_t *, size_t,
+                               size_t, uint32_t *);
+
+struct lmul_config {
+    size_t lmul;
+    vlmax_function get_vlmax;
+    kernel_function indexed_kernel;
+    kernel_function baseline_kernel;
+};
+
+static const struct lmul_config lmul_configs[] = {
+    {1, rvv_vlmax_e32m1, indexed_load_kernel_m1, baseline_kernel_m1},
+    {2, rvv_vlmax_e32m2, indexed_load_kernel_m2, baseline_kernel_m2},
+    {4, rvv_vlmax_e32m4, indexed_load_kernel_m4, baseline_kernel_m4},
+    {8, rvv_vlmax_e32m8, indexed_load_kernel_m8, baseline_kernel_m8},
+};
 
 enum pattern {
     PATTERN_CONTIGUOUS,
@@ -38,6 +74,7 @@ static const char *const pattern_names[PATTERN_COUNT] = {
 enum {
     DEFAULT_ITERATIONS = 100000,
     DEFAULT_REPEATS = 5,
+    DEFAULT_LMUL = 4,
     TEST_PAGE_BYTES = 4096,
     WORDS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
@@ -47,14 +84,25 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "Usage: %s [--pattern NAME] [--iterations N] [--repeats N]\n"
-            "          [--max-vl N]\n"
+            "          [--lmul {1|2|4|8}] [--vl N | --max-vl N]\n"
             "\n"
             "Print a CSV matrix whose rows are VL values and whose columns\n"
             "are indexed-load access patterns. If --pattern is omitted, all\n"
             "patterns are run. Pattern names: contiguous, stride_16B,\n"
-            "cacheline_64B, random_in_page. Each pattern reports baseline,\n"
-            "indexed, and difference values in nanoseconds per iteration.\n",
+            "cacheline_64B, random_in_page. Each pattern reports the paired\n"
+            "baseline difference in nanoseconds per iteration. LMUL defaults\n"
+            "to 4.\n",
             program);
+}
+
+static const struct lmul_config *find_lmul_config(size_t lmul)
+{
+    for (size_t i = 0; i < sizeof(lmul_configs) / sizeof(lmul_configs[0]);
+         ++i) {
+        if (lmul_configs[i].lmul == lmul)
+            return &lmul_configs[i];
+    }
+    return NULL;
 }
 
 static int compare_double(const void *left, const void *right)
@@ -176,10 +224,24 @@ static void fill_indices(uint32_t *indices, const uint32_t *random_word_order,
     }
 }
 
+static void warm_data_page(const uint32_t *data, uint32_t *sink)
+{
+    const volatile uint32_t *volatile_data = data;
+    uint32_t checksum = 0;
+
+    for (size_t byte_offset = 0; byte_offset < TEST_PAGE_BYTES;
+         byte_offset += 64)
+        checksum ^= volatile_data[byte_offset / sizeof(*data)];
+
+    *sink = checksum;
+}
+
 int main(int argc, char **argv)
 {
     size_t iterations = DEFAULT_ITERATIONS;
     size_t repeats = DEFAULT_REPEATS;
+    size_t requested_lmul = DEFAULT_LMUL;
+    size_t requested_vl = 0;
     size_t requested_max_vl = 0;
     size_t selected_pattern = PATTERN_COUNT;
 
@@ -199,6 +261,10 @@ int main(int argc, char **argv)
             iterations = parse_positive(option, argv[++i]);
         else if (strcmp(argv[i], "--repeats") == 0)
             repeats = parse_positive(option, argv[++i]);
+        else if (strcmp(argv[i], "--lmul") == 0)
+            requested_lmul = parse_positive(option, argv[++i]);
+        else if (strcmp(argv[i], "--vl") == 0)
+            requested_vl = parse_positive(option, argv[++i]);
         else if (strcmp(argv[i], "--max-vl") == 0)
             requested_max_vl = parse_positive(option, argv[++i]);
         else {
@@ -208,11 +274,28 @@ int main(int argc, char **argv)
         }
     }
 
-    const size_t hardware_vlmax = rvv_vlmax_e32m4();
-    size_t max_vl = requested_max_vl ? requested_max_vl : hardware_vlmax;
+    if (requested_vl != 0 && requested_max_vl != 0) {
+        fprintf(stderr, "--vl and --max-vl cannot be used together\n");
+        return EXIT_FAILURE;
+    }
+
+    const struct lmul_config *lmul_config = find_lmul_config(requested_lmul);
+    if (lmul_config == NULL) {
+        fprintf(stderr, "--lmul expects one of 1, 2, 4, or 8; got %zu\n",
+                requested_lmul);
+        return EXIT_FAILURE;
+    }
+
+    const size_t hardware_vlmax = lmul_config->get_vlmax();
+    size_t first_vl = requested_vl ? requested_vl : 1;
+    size_t max_vl = requested_vl
+                        ? requested_vl
+                        : (requested_max_vl ? requested_max_vl
+                                            : hardware_vlmax);
     if (max_vl > hardware_vlmax) {
-        fprintf(stderr, "--max-vl %zu exceeds hardware VLMAX %zu\n", max_vl,
-                hardware_vlmax);
+        fprintf(stderr,
+                "requested VL %zu exceeds VLMAX %zu for e32,m%zu\n", max_vl,
+                hardware_vlmax, lmul_config->lmul);
         return EXIT_FAILURE;
     }
     if (max_vl > WORDS_PER_PAGE) {
@@ -232,36 +315,34 @@ int main(int argc, char **argv)
     uint32_t *random_word_order =
         allocate_aligned(TEST_PAGE_BYTES,
                          WORDS_PER_PAGE * sizeof(*random_word_order));
-    if (repeats > SIZE_MAX / (3 * sizeof(double))) {
+    if (repeats > SIZE_MAX / sizeof(double)) {
         fprintf(stderr, "--repeats %zu is too large\n", repeats);
         return EXIT_FAILURE;
     }
-    double *samples = malloc(3 * repeats * sizeof(*samples));
+    double *samples = malloc(repeats * sizeof(*samples));
     if (samples == NULL) {
         perror("malloc");
         return EXIT_FAILURE;
     }
-    double *baseline_samples = samples;
-    double *indexed_samples = samples + repeats;
-    double *difference_samples = samples + 2 * repeats;
 
+    // Loading data[offset / 4] returns offset itself. This makes the result of
+    // one indexed load a valid index vector for the next dependent load.
     for (size_t i = 0; i < data_bytes / sizeof(*data); ++i)
-        data[i] = (uint32_t)(i * UINT32_C(2654435761));
+        data[i] = (uint32_t)(i * sizeof(*data));
     make_random_word_order(random_word_order);
 
     printf("CPU = %d\n", sched_getcpu());
+    printf("LMUL = %zu\n", lmul_config->lmul);
     printf("vl");
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s_baseline_ns,%s_indexed_ns,%s_difference_ns",
-               pattern_names[pattern], pattern_names[pattern],
-               pattern_names[pattern]);
+        printf(",%s_difference_ns", pattern_names[pattern]);
     }
     putchar('\n');
 
-    // test on vl from 1..VLMAX
-    for (size_t vl = 1; vl <= max_vl; ++vl) {
+    // Test one selected VL or the range 1..max_vl.
+    for (size_t vl = first_vl; vl <= max_vl; ++vl) {
         printf("%zu", vl);
         // test against patterns
         for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
@@ -269,6 +350,7 @@ int main(int argc, char **argv)
                 pattern != selected_pattern)
                 continue;
             fill_indices(indices, random_word_order, vl, (enum pattern)pattern);
+            warm_data_page(data, sink);
 
             for (size_t repeat = 0; repeat < repeats; ++repeat) {
                 uint64_t baseline_elapsed;
@@ -276,33 +358,31 @@ int main(int argc, char **argv)
 
                 if (repeat % 2 == 0) {
                     uint64_t start = monotonic_time_ns();
-                    baseline_kernel(data, indices, vl, iterations, sink);
+                    lmul_config->baseline_kernel(data, indices, vl, iterations,
+                                                 sink);
                     baseline_elapsed = monotonic_time_ns() - start;
 
                     start = monotonic_time_ns();
-                    indexed_load_kernel(data, indices, vl, iterations, sink);
+                    lmul_config->indexed_kernel(data, indices, vl, iterations,
+                                                sink);
                     indexed_elapsed = monotonic_time_ns() - start;
                 } else {
                     uint64_t start = monotonic_time_ns();
-                    indexed_load_kernel(data, indices, vl, iterations, sink);
+                    lmul_config->indexed_kernel(data, indices, vl, iterations,
+                                                sink);
                     indexed_elapsed = monotonic_time_ns() - start;
 
                     start = monotonic_time_ns();
-                    baseline_kernel(data, indices, vl, iterations, sink);
+                    lmul_config->baseline_kernel(data, indices, vl, iterations,
+                                                 sink);
                     baseline_elapsed = monotonic_time_ns() - start;
                 }
 
-                baseline_samples[repeat] =
-                    (double)baseline_elapsed / (double)iterations;
-                indexed_samples[repeat] =
-                    (double)indexed_elapsed / (double)iterations;
-                difference_samples[repeat] =
+                samples[repeat] =
                     ((double)indexed_elapsed - (double)baseline_elapsed) /
                     (double)iterations;
             }
-            printf(",%.4f,%.4f,%.4f", median(baseline_samples, repeats),
-                   median(indexed_samples, repeats),
-                   median(difference_samples, repeats));
+            printf(",%.4f", median(samples, repeats));
         }
         putchar('\n');
     }

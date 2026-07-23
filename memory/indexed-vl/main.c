@@ -414,7 +414,8 @@ int main(int argc, char **argv)
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s_cycles_per_vluxei,%s_cycles_per_element",
+        printf(",%s_difference_cycles_per_vluxei,"
+               "%s_difference_cycles_per_element",
                pattern_names[pattern], pattern_names[pattern]);
     }
     putchar('\n');

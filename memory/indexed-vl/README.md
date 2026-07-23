@@ -149,7 +149,7 @@ metrics for that test point:
 ```text
 CPU = 3
 LMUL = 4
-vl,contiguous_cycles_per_vluxei,contiguous_cycles_per_element
+vl,contiguous_difference_cycles_per_vluxei,contiguous_difference_cycles_per_element
 16,...,...
 ```
 

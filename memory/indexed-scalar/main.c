@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -35,6 +36,17 @@ enum pattern {
     PATTERN_COUNT
 };
 
+enum timing_mode {
+    TIMING_CYCLES,
+    TIMING_WALLCLOCK
+};
+
+enum kernel_mode {
+    KERNEL_PAIRED,
+    KERNEL_BASELINE,
+    KERNEL_TARGET
+};
+
 static const char *const pattern_names[PATTERN_COUNT] = {
     "contiguous", "stride_16B", "cacheline_64B", "random_in_page"
 };
@@ -54,13 +66,30 @@ static void usage(const char *program)
     fprintf(stderr,
             "Usage: %s [--pattern NAME] [--iterations N] [--repeats N]\n"
             "          [--vl N | --max-vl N]\n"
+            "          [--cycel | --wallclock]\n"
+            "          [--kernel {paired|baseline|target}]\n"
             "\n"
             "For the scalar benchmark, each outer kernel iteration executes\n"
             "eight lwu instructions for each of the VL indices (8 * VL loads\n"
             "in total), matching the vector kernel's eight-way unroll. If\n"
-            "--pattern is omitted, all patterns are run. Results are paired,\n"
-            "baseline-subtracted CPU cycles per target lwu.\n",
+            "--pattern is omitted, all patterns are run. Paired results are\n"
+            "baseline-subtracted cycles or nanoseconds per target lwu.\n"
+            "--cycel is the default; use --wallclock with outer perf stat.\n",
             program);
+}
+
+static enum kernel_mode parse_kernel_mode(const char *text)
+{
+    if (strcmp(text, "paired") == 0)
+        return KERNEL_PAIRED;
+    if (strcmp(text, "baseline") == 0)
+        return KERNEL_BASELINE;
+    if (strcmp(text, "target") == 0)
+        return KERNEL_TARGET;
+    fprintf(stderr,
+            "--kernel expects paired, baseline, or target; got '%s'\n",
+            text);
+    exit(EXIT_FAILURE);
 }
 
 static int compare_double(const void *left, const void *right)
@@ -154,11 +183,28 @@ static double stop_cycle_counter(int fd,
     return (double)after.value * (double)time_enabled / (double)time_running;
 }
 
-static double measure_kernel_cycles(int counter_fd, kernel_function kernel,
-                                    const uint32_t *data,
-                                    const uint32_t *indices, size_t vl,
-                                    size_t iterations, uint32_t *sink)
+static uint64_t monotonic_time_ns(void)
 {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)now.tv_nsec;
+}
+
+static double measure_kernel(enum timing_mode timing, int counter_fd,
+                             kernel_function kernel, const uint32_t *data,
+                             const uint32_t *indices, size_t vl,
+                             size_t iterations, uint32_t *sink)
+{
+    if (timing == TIMING_WALLCLOCK) {
+        uint64_t start = monotonic_time_ns();
+        kernel(data, indices, vl, iterations, sink);
+        return (double)(monotonic_time_ns() - start);
+    }
+
     struct perf_counter_value before = start_cycle_counter(counter_fd);
     kernel(data, indices, vl, iterations, sink);
     return stop_cycle_counter(counter_fd, &before);
@@ -266,12 +312,36 @@ int main(int argc, char **argv)
     size_t requested_vl = 0;
     size_t requested_max_vl = 0;
     size_t selected_pattern = PATTERN_COUNT;
+    enum timing_mode timing = TIMING_CYCLES;
+    enum kernel_mode selected_kernel = KERNEL_PAIRED;
+    int timing_was_selected = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *option = argv[i];
         if (strcmp(option, "--help") == 0) {
             usage(argv[0]);
             return EXIT_SUCCESS;
+        }
+        if (strcmp(option, "--cycel") == 0 ||
+            strcmp(option, "--cycle") == 0) {
+            if (timing_was_selected && timing != TIMING_CYCLES) {
+                fprintf(stderr,
+                        "--cycel and --wallclock cannot be used together\n");
+                return EXIT_FAILURE;
+            }
+            timing = TIMING_CYCLES;
+            timing_was_selected = 1;
+            continue;
+        }
+        if (strcmp(option, "--wallclock") == 0) {
+            if (timing_was_selected && timing != TIMING_WALLCLOCK) {
+                fprintf(stderr,
+                        "--cycel and --wallclock cannot be used together\n");
+                return EXIT_FAILURE;
+            }
+            timing = TIMING_WALLCLOCK;
+            timing_was_selected = 1;
+            continue;
         }
         if (i + 1 >= argc) {
             usage(argv[0]);
@@ -287,6 +357,8 @@ int main(int argc, char **argv)
             requested_vl = parse_positive(option, argv[++i]);
         else if (strcmp(option, "--max-vl") == 0)
             requested_max_vl = parse_positive(option, argv[++i]);
+        else if (strcmp(option, "--kernel") == 0)
+            selected_kernel = parse_kernel_mode(argv[++i]);
         else {
             fprintf(stderr, "unknown option: %s\n", option);
             usage(argv[0]);
@@ -326,18 +398,32 @@ int main(int argc, char **argv)
         perror("malloc");
         return EXIT_FAILURE;
     }
-    int cycle_counter_fd = open_cycle_counter();
+    int cycle_counter_fd =
+        timing == TIMING_CYCLES ? open_cycle_counter() : -1;
+    const char *unit = timing == TIMING_CYCLES ? "cycles" : "ns";
 
     for (size_t i = 0; i < ELEMENTS_PER_PAGE; ++i)
         data[i] = (uint32_t)(i * sizeof(*data));
     make_random_element_order(random_element_order);
 
     printf("CPU = %d\n", sched_getcpu());
+    printf("Timing = %s\n",
+           timing == TIMING_CYCLES ? "perf_event cycles" : "wallclock");
+    printf("Kernel = %s\n", selected_kernel == KERNEL_PAIRED
+                                  ? "paired"
+                                  : (selected_kernel == KERNEL_BASELINE
+                                         ? "baseline"
+                                         : "target"));
     printf("vl");
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s_difference_cycles_per_lwu", pattern_names[pattern]);
+        if (selected_kernel == KERNEL_BASELINE)
+            printf(",%s_%s_per_iteration", pattern_names[pattern], unit);
+        else if (selected_kernel == KERNEL_TARGET)
+            printf(",%s_%s_per_lwu", pattern_names[pattern], unit);
+        else
+            printf(",%s_difference_%s_per_lwu", pattern_names[pattern], unit);
     }
     putchar('\n');
 
@@ -351,36 +437,52 @@ int main(int argc, char **argv)
                          (enum pattern)pattern);
 
             for (size_t repeat = 0; repeat < repeats; ++repeat) {
-                double baseline_cycles;
-                double load_cycles;
-
-                if (repeat % 2 == 0) {
-                    baseline_cycles = measure_kernel_cycles(
-                        cycle_counter_fd, scalar_baseline_kernel, data,
-                        indices, vl, iterations, sink);
-                    load_cycles = measure_kernel_cycles(
-                        cycle_counter_fd, scalar_load_kernel, data, indices,
-                        vl, iterations, sink);
+                if (selected_kernel == KERNEL_BASELINE) {
+                    samples[repeat] =
+                        measure_kernel(timing, cycle_counter_fd,
+                                       scalar_baseline_kernel, data, indices,
+                                       vl, iterations, sink) /
+                        (double)iterations;
+                } else if (selected_kernel == KERNEL_TARGET) {
+                    samples[repeat] =
+                        measure_kernel(timing, cycle_counter_fd,
+                                       scalar_load_kernel, data, indices, vl,
+                                       iterations, sink) /
+                        ((double)iterations * SCALAR_LOADS_PER_INDEX *
+                         (double)vl);
                 } else {
-                    load_cycles = measure_kernel_cycles(
-                        cycle_counter_fd, scalar_load_kernel, data, indices,
-                        vl, iterations, sink);
-                    baseline_cycles = measure_kernel_cycles(
-                        cycle_counter_fd, scalar_baseline_kernel, data,
-                        indices, vl, iterations, sink);
-                }
+                    double baseline_value;
+                    double load_value;
 
-                samples[repeat] =
-                    (load_cycles - baseline_cycles) /
-                    ((double)iterations * SCALAR_LOADS_PER_INDEX *
-                     (double)vl);
+                    if (repeat % 2 == 0) {
+                        baseline_value = measure_kernel(
+                            timing, cycle_counter_fd, scalar_baseline_kernel,
+                            data, indices, vl, iterations, sink);
+                        load_value = measure_kernel(
+                            timing, cycle_counter_fd, scalar_load_kernel, data,
+                            indices, vl, iterations, sink);
+                    } else {
+                        load_value = measure_kernel(
+                            timing, cycle_counter_fd, scalar_load_kernel, data,
+                            indices, vl, iterations, sink);
+                        baseline_value = measure_kernel(
+                            timing, cycle_counter_fd, scalar_baseline_kernel,
+                            data, indices, vl, iterations, sink);
+                    }
+
+                    samples[repeat] =
+                        (load_value - baseline_value) /
+                        ((double)iterations * SCALAR_LOADS_PER_INDEX *
+                         (double)vl);
+                }
             }
             printf(",%.4f", median(samples, repeats));
         }
         putchar('\n');
     }
 
-    close(cycle_counter_fd);
+    if (cycle_counter_fd >= 0)
+        close(cycle_counter_fd);
     free(samples);
     free(random_element_order);
     free(sink);

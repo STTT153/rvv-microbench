@@ -39,9 +39,10 @@ rvv_vlmax_e32m8:
     #                             size_t vl, size_t iterations,
     #                             uint32_t *sink);
     #
-    # v0 starts the index register group and v8 starts the destination group.
-    # Both registers satisfy the alignment requirements for m1, m2, m4, m8.
-    # The measured loop contains exactly one vector memory instruction.
+    # v0 starts the index register group.  Each loop iteration contains eight
+    # indexed loads, distributed over as many non-overlapping, LMUL-aligned
+    # destination register groups as possible.  This avoids an unnecessary
+    # destination dependency when more than one register group is available.
 
     .globl  indexed_load_kernel_m1
     .type   indexed_load_kernel_m1, @function
@@ -50,9 +51,16 @@ indexed_load_kernel_m1:
     vle32.v v0, (a1)
 1:
     vluxei32.v v8, (a0), v0
+    vluxei32.v v9, (a0), v0
+    vluxei32.v v10, (a0), v0
+    vluxei32.v v11, (a0), v0
+    vluxei32.v v12, (a0), v0
+    vluxei32.v v13, (a0), v0
+    vluxei32.v v14, (a0), v0
+    vluxei32.v v15, (a0), v0
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v15, (a4)
     fence   rw, rw
     ret
     .size   indexed_load_kernel_m1, .-indexed_load_kernel_m1
@@ -63,10 +71,17 @@ indexed_load_kernel_m2:
     vsetvli t0, a2, e32, m2, ta, ma
     vle32.v v0, (a1)
 1:
+    vluxei32.v v2, (a0), v0
+    vluxei32.v v4, (a0), v0
+    vluxei32.v v6, (a0), v0
     vluxei32.v v8, (a0), v0
+    vluxei32.v v10, (a0), v0
+    vluxei32.v v12, (a0), v0
+    vluxei32.v v14, (a0), v0
+    vluxei32.v v16, (a0), v0
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v16, (a4)
     fence   rw, rw
     ret
     .size   indexed_load_kernel_m2, .-indexed_load_kernel_m2
@@ -77,10 +92,17 @@ indexed_load_kernel_m4:
     vsetvli t0, a2, e32, m4, ta, ma
     vle32.v v0, (a1)
 1:
+    vluxei32.v v4, (a0), v0
     vluxei32.v v8, (a0), v0
+    vluxei32.v v12, (a0), v0
+    vluxei32.v v16, (a0), v0
+    vluxei32.v v20, (a0), v0
+    vluxei32.v v24, (a0), v0
+    vluxei32.v v28, (a0), v0
+    vluxei32.v v4, (a0), v0
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v4, (a4)
     fence   rw, rw
     ret
     .size   indexed_load_kernel_m4, .-indexed_load_kernel_m4
@@ -92,9 +114,16 @@ indexed_load_kernel_m8:
     vle32.v v0, (a1)
 1:
     vluxei32.v v8, (a0), v0
+    vluxei32.v v16, (a0), v0
+    vluxei32.v v24, (a0), v0
+    vluxei32.v v8, (a0), v0
+    vluxei32.v v16, (a0), v0
+    vluxei32.v v24, (a0), v0
+    vluxei32.v v8, (a0), v0
+    vluxei32.v v16, (a0), v0
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v16, (a4)
     fence   rw, rw
     ret
     .size   indexed_load_kernel_m8, .-indexed_load_kernel_m8

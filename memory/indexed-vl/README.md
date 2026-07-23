@@ -2,8 +2,8 @@
 
 ## Goal
 
-Measure the steady-state cost of one `vluxei32.v` while varying both vector
-length (VL) and the index access pattern.
+Measure the steady-state cost of an eight-way-unrolled `vluxei32.v` sequence
+while varying both vector length (VL) and the index access pattern.
 
 Different `LMUL` would also be selected for different `VLMAX`. The program detects VLMAX for the
 selected LMUL at runtime (Assume VLEN=256 for X100) and
@@ -46,8 +46,9 @@ For every matrix cell, the program:
 
 For every supported LMUL, the corresponding assembly kernel and baseline have
 the same ABI, vector setup, index load, scalar loop, sink store, and fence. The
-only instruction present in the indexed loop but absent from its baseline is
-`vluxei32.v v8, (a0), v0`.
+indexed loop contains eight `vluxei32.v` instructions that are absent from its
+baseline. They are distributed over as many non-overlapping, LMUL-aligned
+destination register groups as possible.
 
 An example kernel for LMUL=1
 
@@ -59,9 +60,16 @@ indexed_load_kernel_m1:
     vle32.v v0, (a1)
 1:
     vluxei32.v v8, (a0), v0
+    vluxei32.v v9, (a0), v0
+    vluxei32.v v10, (a0), v0
+    vluxei32.v v11, (a0), v0
+    vluxei32.v v12, (a0), v0
+    vluxei32.v v13, (a0), v0
+    vluxei32.v v14, (a0), v0
+    vluxei32.v v15, (a0), v0
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v15, (a4)
     fence   rw, rw
     ret
     .size   indexed_load_kernel_m1, .-indexed_load_kernel_m1
@@ -144,9 +152,11 @@ vl,contiguous_difference_ns
 ```
 
 `difference_ns` is the median of the paired, baseline-subtracted samples in
-nanoseconds per loop iteration, not nanoseconds per element. Timer or OS noise
-can occasionally produce a small negative difference; it is not clamped. When
-all patterns are selected, every pattern contributes one difference column.
+nanoseconds per loop iteration. Each iteration contains eight vector indexed
+loads, or `8 * VL` loaded elements. It is not nanoseconds per instruction or
+per element. Timer or OS noise can occasionally produce a small negative
+difference; it is not clamped. When all patterns are selected, every pattern
+contributes one difference column.
 
 ## Reference environment
 

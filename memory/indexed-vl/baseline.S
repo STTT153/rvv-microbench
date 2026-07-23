@@ -1,8 +1,9 @@
     .section .text
     .align  2
 
-    # Each baseline matches its corresponding indexed-load kernel except for
-    # the omitted vluxei32.v instruction.
+    # Each baseline matches its corresponding eight-way-unrolled indexed-load
+    # kernel except for the omitted vluxei32.v instructions.  The sink store
+    # uses the destination of the indexed kernel's final unrolled load.
 
     .globl  baseline_kernel_m1
     .type   baseline_kernel_m1, @function
@@ -12,7 +13,7 @@ baseline_kernel_m1:
 1:
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v15, (a4)
     fence   rw, rw
     ret
     .size   baseline_kernel_m1, .-baseline_kernel_m1
@@ -25,7 +26,7 @@ baseline_kernel_m2:
 1:
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v16, (a4)
     fence   rw, rw
     ret
     .size   baseline_kernel_m2, .-baseline_kernel_m2
@@ -38,7 +39,7 @@ baseline_kernel_m4:
 1:
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v4, (a4)
     fence   rw, rw
     ret
     .size   baseline_kernel_m4, .-baseline_kernel_m4
@@ -51,7 +52,7 @@ baseline_kernel_m8:
 1:
     addi    a3, a3, -1
     bnez    a3, 1b
-    vse32.v v8, (a4)
+    vse32.v v16, (a4)
     fence   rw, rw
     ret
     .size   baseline_kernel_m8, .-baseline_kernel_m8

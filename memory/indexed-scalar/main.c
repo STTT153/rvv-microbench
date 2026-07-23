@@ -17,11 +17,11 @@ static int sched_getcpu(void)
 }
 #endif
 
-extern void scalar_load_kernel(const uint64_t *data, const uint32_t *indices,
-                               size_t vl, size_t iterations, uint64_t *sink);
-extern void scalar_baseline_kernel(const uint64_t *data,
+extern void scalar_load_kernel(const uint32_t *data, const uint32_t *indices,
+                               size_t vl, size_t iterations, uint32_t *sink);
+extern void scalar_baseline_kernel(const uint32_t *data,
                                    const uint32_t *indices, size_t vl,
-                                   size_t iterations, uint64_t *sink);
+                                   size_t iterations, uint32_t *sink);
 
 enum pattern {
     PATTERN_CONTIGUOUS,
@@ -40,7 +40,7 @@ enum {
     DEFAULT_REPEATS = 5,
     DEFAULT_MAX_VL = 32,
     TEST_PAGE_BYTES = 4096,
-    ELEMENTS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint64_t),
+    ELEMENTS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
 };
 
@@ -50,9 +50,10 @@ static void usage(const char *program)
             "Usage: %s [--pattern NAME] [--iterations N] [--repeats N]\n"
             "          [--vl N | --max-vl N]\n"
             "\n"
-            "For the scalar benchmark, VL is the number of ld instructions\n"
-            "executed in each outer kernel iteration. If --pattern is\n"
-            "omitted, all patterns are run.\n",
+            "For the scalar benchmark, each outer kernel iteration executes\n"
+            "eight lwu instructions for each of the VL indices (8 * VL loads\n"
+            "in total), matching the vector kernel's eight-way unroll. If\n"
+            "--pattern is omitted, all patterns are run.\n",
             program);
 }
 
@@ -154,7 +155,7 @@ static void fill_indices(uint32_t *indices,
         size_t offset;
         switch (pattern) {
         case PATTERN_CONTIGUOUS:
-            offset = (i % ELEMENTS_PER_PAGE) * sizeof(uint64_t);
+            offset = (i % ELEMENTS_PER_PAGE) * sizeof(uint32_t);
             break;
         case PATTERN_STRIDE_16B:
             offset = (i % (TEST_PAGE_BYTES / 16)) * 16;
@@ -165,13 +166,13 @@ static void fill_indices(uint32_t *indices,
         case PATTERN_RANDOM_IN_PAGE:
             offset =
                 (size_t)random_element_order[i % ELEMENTS_PER_PAGE] *
-                sizeof(uint64_t);
+                sizeof(uint32_t);
             break;
         default:
             abort();
         }
-        if (offset > TEST_PAGE_BYTES - sizeof(uint64_t) ||
-            offset % sizeof(uint64_t) != 0)
+        if (offset > TEST_PAGE_BYTES - sizeof(uint32_t) ||
+            offset % sizeof(uint32_t) != 0)
             abort();
         indices[i] = (uint32_t)offset;
     }
@@ -232,10 +233,10 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    uint64_t *data = allocate_aligned(TEST_PAGE_BYTES, TEST_PAGE_BYTES);
+    uint32_t *data = allocate_aligned(TEST_PAGE_BYTES, TEST_PAGE_BYTES);
     uint32_t *indices =
         allocate_aligned(TEST_PAGE_BYTES, max_vl * sizeof(*indices));
-    uint64_t *sink = allocate_aligned(TEST_PAGE_BYTES, sizeof(*sink));
+    uint32_t *sink = allocate_aligned(TEST_PAGE_BYTES, sizeof(*sink));
     uint32_t *random_element_order =
         allocate_aligned(TEST_PAGE_BYTES,
                          ELEMENTS_PER_PAGE * sizeof(*random_element_order));
@@ -246,7 +247,7 @@ int main(int argc, char **argv)
     }
 
     for (size_t i = 0; i < ELEMENTS_PER_PAGE; ++i)
-        data[i] = (uint64_t)i * UINT64_C(11400714819323198485);
+        data[i] = (uint32_t)(i * sizeof(*data));
     make_random_element_order(random_element_order);
 
     printf("CPU = %d\n", sched_getcpu());

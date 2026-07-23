@@ -1,16 +1,17 @@
     .section .text
     .align  2
 
-    # void scalar_baseline_kernel(const uint64_t *data,
+    # void scalar_baseline_kernel(const uint32_t *data,
     #                             const uint32_t *indices,
     #                             size_t vl, size_t iterations,
-    #                             uint64_t *sink);
+    #                             uint32_t *sink);
     #
-    # Match scalar_load_kernel except for the omitted target ld instruction.
+    # Match scalar_load_kernel except for the eight omitted target lwu
+    # instructions issued for every index.
     .globl  scalar_baseline_kernel
     .type   scalar_baseline_kernel, @function
 scalar_baseline_kernel:
-    li      t4, 0
+    li      t5, 0
 1:
     mv      t0, a1
     mv      t1, a2
@@ -23,7 +24,7 @@ scalar_baseline_kernel:
     addi    a3, a3, -1
     bnez    a3, 1b
 
-    sd      t4, 0(a4)
+    sw      t5, 0(a4)
     fence   rw, rw
     ret
     .size   scalar_baseline_kernel, .-scalar_baseline_kernel

@@ -6,15 +6,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <unistd.h>
 
 #ifdef __linux__
+#include <linux/perf_event.h>
 #include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 #else
-static int sched_getcpu(void)
-{
-    return -1;
-}
+#error "This benchmark requires Linux perf_event support"
 #endif
 
 typedef size_t (*vlmax_function)(void);
@@ -75,6 +75,7 @@ enum {
     DEFAULT_ITERATIONS = 100000,
     DEFAULT_REPEATS = 5,
     DEFAULT_LMUL = 4,
+    INDEXED_LOAD_UNROLL = 8,
     TEST_PAGE_BYTES = 4096,
     WORDS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
@@ -90,8 +91,8 @@ static void usage(const char *program)
             "are indexed-load access patterns. If --pattern is omitted, all\n"
             "patterns are run. Pattern names: contiguous, stride_16B,\n"
             "cacheline_64B, random_in_page. Each pattern reports the paired\n"
-            "baseline difference in nanoseconds per iteration. LMUL defaults\n"
-            "to 4.\n",
+            "baseline-subtracted CPU cycles per vluxei32.v and per loaded\n"
+            "element. LMUL defaults to 4.\n",
             program);
 }
 
@@ -120,6 +121,92 @@ static double median(double *values, size_t count)
     return (values[count / 2 - 1] + values[count / 2]) / 2.0;
 }
 
+struct perf_counter_value {
+    uint64_t value;
+    uint64_t time_enabled;
+    uint64_t time_running;
+};
+
+static int open_cycle_counter(void)
+{
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_HW_CPU_CYCLES;
+    attr.disabled = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                       PERF_FORMAT_TOTAL_TIME_RUNNING;
+
+    int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd < 0) {
+        perror("perf_event_open(CPU cycles)");
+        fprintf(stderr,
+                "check whether the kernel and perf_event_paranoid allow "
+                "per-thread hardware counters\n");
+        exit(EXIT_FAILURE);
+    }
+    return fd;
+}
+
+static struct perf_counter_value read_cycle_counter(int fd)
+{
+    struct perf_counter_value counter;
+    ssize_t bytes = read(fd, &counter, sizeof(counter));
+    if (bytes != (ssize_t)sizeof(counter)) {
+        if (bytes < 0)
+            perror("reading perf cycle counter");
+        else
+            fprintf(stderr, "short read from perf cycle counter\n");
+        exit(EXIT_FAILURE);
+    }
+    return counter;
+}
+
+static struct perf_counter_value start_cycle_counter(int fd)
+{
+    if (ioctl(fd, PERF_EVENT_IOC_RESET, 0) != 0) {
+        perror("resetting perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    struct perf_counter_value before = read_cycle_counter(fd);
+    if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+        perror("starting perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    return before;
+}
+
+static double stop_cycle_counter(int fd,
+                                 const struct perf_counter_value *before)
+{
+    if (ioctl(fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+        perror("stopping perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    struct perf_counter_value after = read_cycle_counter(fd);
+    uint64_t time_enabled = after.time_enabled - before->time_enabled;
+    uint64_t time_running = after.time_running - before->time_running;
+    if (time_running == 0) {
+        fprintf(stderr, "perf cycle counter was never scheduled\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return (double)after.value * (double)time_enabled / (double)time_running;
+}
+
+static double measure_kernel_cycles(int counter_fd, kernel_function kernel,
+                                    const uint32_t *data,
+                                    const uint32_t *indices, size_t vl,
+                                    size_t iterations, uint32_t *sink)
+{
+    struct perf_counter_value before = start_cycle_counter(counter_fd);
+    kernel(data, indices, vl, iterations, sink);
+    return stop_cycle_counter(counter_fd, &before);
+}
+
 static size_t parse_pattern(const char *text)
 {
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
@@ -132,17 +219,6 @@ static size_t parse_pattern(const char *text)
         fprintf(stderr, " %s", pattern_names[pattern]);
     fputc('\n', stderr);
     exit(EXIT_FAILURE);
-}
-
-static uint64_t monotonic_time_ns(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
-    }
-    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
-           (uint64_t)now.tv_nsec;
 }
 
 static size_t parse_positive(const char *option, const char *text)
@@ -324,6 +400,7 @@ int main(int argc, char **argv)
         perror("malloc");
         return EXIT_FAILURE;
     }
+    int cycle_counter_fd = open_cycle_counter();
 
     // Loading data[offset / 4] returns offset itself. This makes the result of
     // one indexed load a valid index vector for the next dependent load.
@@ -337,7 +414,8 @@ int main(int argc, char **argv)
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s_difference_ns", pattern_names[pattern]);
+        printf(",%s_cycles_per_vluxei,%s_cycles_per_element",
+               pattern_names[pattern], pattern_names[pattern]);
     }
     putchar('\n');
 
@@ -353,40 +431,37 @@ int main(int argc, char **argv)
             warm_data_page(data, sink);
 
             for (size_t repeat = 0; repeat < repeats; ++repeat) {
-                uint64_t baseline_elapsed;
-                uint64_t indexed_elapsed;
+                double baseline_cycles;
+                double indexed_cycles;
 
                 if (repeat % 2 == 0) {
-                    uint64_t start = monotonic_time_ns();
-                    lmul_config->baseline_kernel(data, indices, vl, iterations,
-                                                 sink);
-                    baseline_elapsed = monotonic_time_ns() - start;
-
-                    start = monotonic_time_ns();
-                    lmul_config->indexed_kernel(data, indices, vl, iterations,
-                                                sink);
-                    indexed_elapsed = monotonic_time_ns() - start;
+                    baseline_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, lmul_config->baseline_kernel, data,
+                        indices, vl, iterations, sink);
+                    indexed_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, lmul_config->indexed_kernel, data,
+                        indices, vl, iterations, sink);
                 } else {
-                    uint64_t start = monotonic_time_ns();
-                    lmul_config->indexed_kernel(data, indices, vl, iterations,
-                                                sink);
-                    indexed_elapsed = monotonic_time_ns() - start;
-
-                    start = monotonic_time_ns();
-                    lmul_config->baseline_kernel(data, indices, vl, iterations,
-                                                 sink);
-                    baseline_elapsed = monotonic_time_ns() - start;
+                    indexed_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, lmul_config->indexed_kernel, data,
+                        indices, vl, iterations, sink);
+                    baseline_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, lmul_config->baseline_kernel, data,
+                        indices, vl, iterations, sink);
                 }
 
                 samples[repeat] =
-                    ((double)indexed_elapsed - (double)baseline_elapsed) /
-                    (double)iterations;
+                    (indexed_cycles - baseline_cycles) /
+                    ((double)iterations * INDEXED_LOAD_UNROLL);
             }
-            printf(",%.4f", median(samples, repeats));
+            double cycles_per_vluxei = median(samples, repeats);
+            printf(",%.4f,%.4f", cycles_per_vluxei,
+                   cycles_per_vluxei / (double)vl);
         }
         putchar('\n');
     }
 
+    close(cycle_counter_fd);
     free(samples);
     free(random_word_order);
     free(sink);

@@ -37,12 +37,14 @@ verified use `perf`.
 For every matrix cell, the program:
 
 1. builds the selected index vector in memory;
-2. measures `baseline_kernel` and `indexed_load_kernel` as a pair with
-   `clock_gettime(CLOCK_MONOTONIC)`;
+2. measures `baseline_kernel` and `indexed_load_kernel` as a pair with a
+   per-thread `perf_event_open` hardware CPU-cycle counter;
 3. repeats the pair for the configured repeat count, alternating which kernel
    runs first;
-4. computes `(indexed_time - baseline_time) / iterations` for every pair; and
-5. reports the median paired difference.
+4. computes `(indexed_cycles - baseline_cycles) / (iterations * 8)` to obtain
+   cycles per `vluxei32.v`, then divides that value by VL to obtain cycles per
+   loaded element; and
+5. reports the median paired result.
 
 For every supported LMUL, the corresponding assembly kernel and baseline have
 the same ABI, vector setup, index load, scalar loop, sink store, and fence. The
@@ -141,22 +143,21 @@ Build it from this directory with `make scalar`, or run it with:
 make scalar-run RUN_ARGS="--vl 16 --pattern contiguous --iterations 200000 --repeats 7"
 ```
 
-With `--vl 16 --pattern contiguous`, the output contains only the paired
-difference for that test point:
+With `--vl 16 --pattern contiguous`, the output contains both normalized
+metrics for that test point:
 
 ```text
 CPU = 3
 LMUL = 4
-vl,contiguous_difference_ns
-16,112.4362
+vl,contiguous_cycles_per_vluxei,contiguous_cycles_per_element
+16,...,...
 ```
 
-`difference_ns` is the median of the paired, baseline-subtracted samples in
-nanoseconds per loop iteration. Each iteration contains eight vector indexed
-loads, or `8 * VL` loaded elements. It is not nanoseconds per instruction or
-per element. Timer or OS noise can occasionally produce a small negative
-difference; it is not clamped. When all patterns are selected, every pattern
-contributes one difference column.
+The first metric divides by the `iterations * 8` dynamically executed vector
+indexed-load instructions. The second divides once more by VL. The perf event
+excludes kernel and hypervisor cycles and scales the count if the event was
+multiplexed. Measurement noise can occasionally produce a small negative
+baseline-subtracted result; it is not clamped.
 
 ## Reference environment
 
@@ -172,6 +173,10 @@ contributes one difference column.
   - L2: 10 MiB total (4 × 2560 KiB)
 
 ## Experiment results
+
+The results below were collected with the earlier single-load,
+`clock_gettime`-based implementation. They are retained as historical data and
+are not directly comparable with the current eight-way perf-event results.
 
 | Parameter | Value |
 | --- | ---: |

@@ -6,16 +6,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <unistd.h>
 
 #ifdef __linux__
+#include <linux/perf_event.h>
 #include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 #else
-static int sched_getcpu(void)
-{
-    return -1;
-}
+#error "This benchmark requires Linux perf_event support"
 #endif
+
+typedef void (*kernel_function)(const uint32_t *data,
+                                const uint32_t *indices, size_t vl,
+                                size_t iterations, uint32_t *sink);
 
 extern void scalar_load_kernel(const uint32_t *data, const uint32_t *indices,
                                size_t vl, size_t iterations, uint32_t *sink);
@@ -39,6 +43,7 @@ enum {
     DEFAULT_ITERATIONS = 100000,
     DEFAULT_REPEATS = 5,
     DEFAULT_MAX_VL = 32,
+    SCALAR_LOADS_PER_INDEX = 8,
     TEST_PAGE_BYTES = 4096,
     ELEMENTS_PER_PAGE = TEST_PAGE_BYTES / (int)sizeof(uint32_t),
     CACHE_LINES_PER_PAGE = TEST_PAGE_BYTES / 64
@@ -53,7 +58,8 @@ static void usage(const char *program)
             "For the scalar benchmark, each outer kernel iteration executes\n"
             "eight lwu instructions for each of the VL indices (8 * VL loads\n"
             "in total), matching the vector kernel's eight-way unroll. If\n"
-            "--pattern is omitted, all patterns are run.\n",
+            "--pattern is omitted, all patterns are run. Results are paired,\n"
+            "baseline-subtracted CPU cycles per target lwu.\n",
             program);
 }
 
@@ -70,6 +76,92 @@ static double median(double *values, size_t count)
     if (count % 2 != 0)
         return values[count / 2];
     return (values[count / 2 - 1] + values[count / 2]) / 2.0;
+}
+
+struct perf_counter_value {
+    uint64_t value;
+    uint64_t time_enabled;
+    uint64_t time_running;
+};
+
+static int open_cycle_counter(void)
+{
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_HW_CPU_CYCLES;
+    attr.disabled = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                       PERF_FORMAT_TOTAL_TIME_RUNNING;
+
+    int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd < 0) {
+        perror("perf_event_open(CPU cycles)");
+        fprintf(stderr,
+                "check whether the kernel and perf_event_paranoid allow "
+                "per-thread hardware counters\n");
+        exit(EXIT_FAILURE);
+    }
+    return fd;
+}
+
+static struct perf_counter_value read_cycle_counter(int fd)
+{
+    struct perf_counter_value counter;
+    ssize_t bytes = read(fd, &counter, sizeof(counter));
+    if (bytes != (ssize_t)sizeof(counter)) {
+        if (bytes < 0)
+            perror("reading perf cycle counter");
+        else
+            fprintf(stderr, "short read from perf cycle counter\n");
+        exit(EXIT_FAILURE);
+    }
+    return counter;
+}
+
+static struct perf_counter_value start_cycle_counter(int fd)
+{
+    if (ioctl(fd, PERF_EVENT_IOC_RESET, 0) != 0) {
+        perror("resetting perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    struct perf_counter_value before = read_cycle_counter(fd);
+    if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+        perror("starting perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    return before;
+}
+
+static double stop_cycle_counter(int fd,
+                                 const struct perf_counter_value *before)
+{
+    if (ioctl(fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+        perror("stopping perf cycle counter");
+        exit(EXIT_FAILURE);
+    }
+    struct perf_counter_value after = read_cycle_counter(fd);
+    uint64_t time_enabled = after.time_enabled - before->time_enabled;
+    uint64_t time_running = after.time_running - before->time_running;
+    if (time_running == 0) {
+        fprintf(stderr, "perf cycle counter was never scheduled\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return (double)after.value * (double)time_enabled / (double)time_running;
+}
+
+static double measure_kernel_cycles(int counter_fd, kernel_function kernel,
+                                    const uint32_t *data,
+                                    const uint32_t *indices, size_t vl,
+                                    size_t iterations, uint32_t *sink)
+{
+    struct perf_counter_value before = start_cycle_counter(counter_fd);
+    kernel(data, indices, vl, iterations, sink);
+    return stop_cycle_counter(counter_fd, &before);
 }
 
 static size_t parse_pattern(const char *text)
@@ -98,17 +190,6 @@ static size_t parse_positive(const char *option, const char *text)
         exit(EXIT_FAILURE);
     }
     return (size_t)value;
-}
-
-static uint64_t monotonic_time_ns(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
-    }
-    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
-           (uint64_t)now.tv_nsec;
 }
 
 static void *allocate_aligned(size_t alignment, size_t bytes)
@@ -245,6 +326,7 @@ int main(int argc, char **argv)
         perror("malloc");
         return EXIT_FAILURE;
     }
+    int cycle_counter_fd = open_cycle_counter();
 
     for (size_t i = 0; i < ELEMENTS_PER_PAGE; ++i)
         data[i] = (uint32_t)(i * sizeof(*data));
@@ -255,7 +337,7 @@ int main(int argc, char **argv)
     for (size_t pattern = 0; pattern < PATTERN_COUNT; ++pattern) {
         if (selected_pattern != PATTERN_COUNT && pattern != selected_pattern)
             continue;
-        printf(",%s_difference_ns", pattern_names[pattern]);
+        printf(",%s_cycles_per_lwu", pattern_names[pattern]);
     }
     putchar('\n');
 
@@ -269,38 +351,36 @@ int main(int argc, char **argv)
                          (enum pattern)pattern);
 
             for (size_t repeat = 0; repeat < repeats; ++repeat) {
-                uint64_t baseline_elapsed;
-                uint64_t load_elapsed;
+                double baseline_cycles;
+                double load_cycles;
 
                 if (repeat % 2 == 0) {
-                    uint64_t start = monotonic_time_ns();
-                    scalar_baseline_kernel(data, indices, vl, iterations,
-                                           sink);
-                    baseline_elapsed = monotonic_time_ns() - start;
-
-                    start = monotonic_time_ns();
-                    scalar_load_kernel(data, indices, vl, iterations, sink);
-                    load_elapsed = monotonic_time_ns() - start;
+                    baseline_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, scalar_baseline_kernel, data,
+                        indices, vl, iterations, sink);
+                    load_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, scalar_load_kernel, data, indices,
+                        vl, iterations, sink);
                 } else {
-                    uint64_t start = monotonic_time_ns();
-                    scalar_load_kernel(data, indices, vl, iterations, sink);
-                    load_elapsed = monotonic_time_ns() - start;
-
-                    start = monotonic_time_ns();
-                    scalar_baseline_kernel(data, indices, vl, iterations,
-                                           sink);
-                    baseline_elapsed = monotonic_time_ns() - start;
+                    load_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, scalar_load_kernel, data, indices,
+                        vl, iterations, sink);
+                    baseline_cycles = measure_kernel_cycles(
+                        cycle_counter_fd, scalar_baseline_kernel, data,
+                        indices, vl, iterations, sink);
                 }
 
                 samples[repeat] =
-                    ((double)load_elapsed - (double)baseline_elapsed) /
-                    (double)iterations;
+                    (load_cycles - baseline_cycles) /
+                    ((double)iterations * SCALAR_LOADS_PER_INDEX *
+                     (double)vl);
             }
             printf(",%.4f", median(samples, repeats));
         }
         putchar('\n');
     }
 
+    close(cycle_counter_fd);
     free(samples);
     free(random_element_order);
     free(sink);

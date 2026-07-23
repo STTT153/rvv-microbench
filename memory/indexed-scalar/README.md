@@ -17,16 +17,17 @@ All referenced data stays inside one 4 KiB-aligned page. The patterns are:
 | `cacheline_64B` | `(i * 64) % 4096` |
 | `random_in_page` | fixed shuffled 4-byte-aligned order |
 
-Like the vector benchmark, there is no separate short warm-up pass. Each timed
-kernel itself runs for the full configured iteration count, naturally reaching
-steady state. Every measured repeat alternates the kernel order and computes:
+Like the vector benchmark, there is no separate short warm-up pass. Each
+kernel runs for the full configured iteration count. A per-thread
+`perf_event_open` hardware CPU-cycle counter measures each kernel, and every
+repeat alternates the kernel order and computes:
 
 ```text
-(scalar_load_time - scalar_baseline_time) / iterations
+(scalar_load_cycles - scalar_baseline_cycles) / (iterations * 8 * VL)
 ```
 
-The result is the median paired difference. It is the time for `8 * VL`
-scalar loads; divide it by `8 * VL` to obtain time per scalar `lwu`.
+The reported result is therefore the median paired, baseline-subtracted CPU
+cycles per target scalar `lwu`.
 
 The baseline contains the same outer/inner loops, 32-bit index loads, address
 calculations, final sink store, and fence. It omits only the eight target `lwu`
